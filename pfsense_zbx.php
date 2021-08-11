@@ -1,11 +1,15 @@
 <?php
 /*** 
 pfsense_zbx.php - pfSense Zabbix Interface
-Version 1.0.2 - 2021-01-18
+Version 1.0.5 - 2021-07-05
 
 Written by Riccardo Bicelli <r.bicelli@gmail.com>
 This program is licensed under Apache 2.0 License
 */
+
+//Some Useful defines
+
+define('SPEEDTEST_INTERVAL', 8); //Speedtest Interval (in hours)
 
 require_once('globals.inc');
 require_once('functions.inc');
@@ -89,37 +93,138 @@ function pfz_test(){
 
 // Interface Discovery
 // Improved performance
-function pfz_interface_discovery() {
+function pfz_interface_discovery($is_wan=false,$is_cron=false) {
     $ifdescrs = get_configured_interface_with_descr(true);
     $ifaces = get_interface_arr();
     $ifcs=array();
+    $if_ret=array();
  
     $json_string = '{"data":[';
                    
     foreach ($ifdescrs as $ifname => $ifdescr){
           $ifinfo = get_interface_info($ifname);
           $ifinfo["description"] = $ifdescr;
-          $ifcs[$ifname] = $ifinfo;
-    }
+	      $ifcs[$ifname] = $ifinfo;	      
+    }    
 
     foreach ($ifaces as $hwif) {
-        $json_string .= '{"{#IFNAME}":"' . $hwif . '"';
-
+        
         $ifdescr = $hwif;
+        $has_gw = false;
+        $is_vpn = false;
+        
         foreach($ifcs as $ifc=>$ifinfo){
                 if ($ifinfo["hwif"] == $hwif){
                         $ifdescr = $ifinfo["description"];
+                        if (array_key_exists("gateway",$ifinfo)) $has_gw=true;
+                        if (strpos($ifinfo["if"],"ovpn")!==false) $is_vpn=true;
                         break;
                 }
         }
-
-        $json_string .= ',"{#IFDESCR}":"' . $ifdescr . '"';
-        $json_string .= '},';
+		
+		if ( ($is_wan==false) ||  (($is_wan==true) && ($has_gw==true) && ($is_vpn==false)) ) { 
+		    $if_ret[]=$hwif;
+		    $json_string .= '{"{#IFNAME}":"' . $hwif . '"';
+		    $json_string .= ',"{#IFDESCR}":"' . $ifdescr . '"';
+		    $json_string .= '},';
+        }
+    
     }
     $json_string = rtrim($json_string,",");
     $json_string .= "]}";
 
+	if ($is_cron) return $if_ret;
+	
     echo $json_string;
+}
+
+
+//Interface Speedtest
+function pfz_interface_speedtest_value($ifname, $value){	
+    $tvalue = explode(".", $value);    
+    
+    if (count($tvalue)>1) {
+    	$value = $tvalue[0];
+    	$subvalue = $tvalue[1];
+    }        
+    
+	//If the interface has a gateway is considered WAN, so let's do the speedtest
+	$filename = "/tmp/speedtest-$ifname";
+	
+	if (file_exists($filename)) {
+		$speedtest_data = json_decode(file_get_contents($filename), true);
+		
+		if (array_key_exists($value, $speedtest_data)) {
+			if ($subvalue == false) 
+				echo $speedtest_data[$value];
+			else
+				echo $speedtest_data[$value][$subvalue];
+		}	
+	}
+			
+}
+
+
+function pfz_speedtest_cron(){
+	require_once("services.inc");
+	$ifdescrs = get_configured_interface_with_descr(true);
+    $ifaces = get_interface_arr();
+    $pf_interface_name='';
+    $subvalue=false;    
+		                       
+    $ifcs = pfz_interface_discovery(true, true);    
+    
+    foreach ($ifcs as $ifname) {    	  
+          
+          foreach ($ifdescrs as $ifn => $ifd){
+		      $ifinfo = get_interface_info($ifn);
+		      if($ifinfo['hwif']==$ifname) {
+		      	$pf_interface_name = $ifn;
+		      	break;
+		      }
+    	  }
+          
+          //If the interface has a gateway is considered WAN, so let's do the speedtest
+          if (array_key_exists("gateway", $ifinfo)) {				
+		  	$ipaddr = $ifinfo['ipaddr'];		
+			pfz_speedtest_exec($ifname, $ipaddr);		
+		  }
+				          	
+    }
+}
+
+//installs a cron job for speedtests
+function pfz_speedtest_cron_install($enable=true){
+	//Install Cron Job
+	$command = "/usr/local/bin/php " . __FILE__ . " speedtest_cron";
+	install_cron_job($command, $enable, $minute = "*/15", "*", "*", "*", "*", "root", true);
+}        	
+
+
+function pfz_speedtest_exec ($ifname, $ipaddr){
+	
+	$filename = "/tmp/speedtest-$ifname";
+	$filetemp = "$filename.tmp";
+	$filerun = "/tmp/speedtest-run"; 
+	
+	// Issue #82
+	// Sleep random delay in order to avoid problem when 2 pfSense on the same Internet line
+	sleep (rand ( 1, 90));
+	
+	if ( (time()-filemtime($filename) > SPEEDTEST_INTERVAL * 3600) || (file_exists($filename)==false) ) {
+	  	// file is older than SPEEDTEST_INTERVAL
+	  	if ( (time()-filemtime($filerun) > 180 ) ) @unlink($filerun);
+
+		if (file_exists($filerun)==false) {	  			  		
+	  		touch($filerun);
+	  		$st_command = "/usr/local/bin/speedtest --source $ipaddr --json > $filetemp";
+			exec ($st_command);
+			rename($filetemp,$filename);
+			@unlink($filerun);
+		}
+	}	
+	
+	return true;
 }
 
 
@@ -201,7 +306,7 @@ function pfz_openvpn_server_userdiscovery(){
      $json_string = '{"data":[';
 
      foreach ($servers as $server){
-          if ( ($server['mode']=='server_user') || ($server['mode']=='server_tls_user') ) {
+          if ( ($server['mode']=='server_user') || ($server['mode']=='server_tls_user') || ($server['mode']=='server_tls') ) {
                if (is_array($server['conns'])) {               
                     $name = trim(preg_replace('/\w{3}(\d)?\:\d{4,5}/i', '', $server['name']));
                     
@@ -568,12 +673,14 @@ function pfz_ipsec_status($ikeid,$reqid=-1,$valuekey='state'){
 				$con_id = filter_var($l_ikeid, FILTER_SANITIZE_NUMBER_INT);
 			}
 			if ($ikesa['version'] == 1) {
-				$ph1idx = substr($con_id, 0, strrpos(substr($con_id, 0, -1), '00'));
+				$ph1idx = $con_id/1000;
+				if ($ph1idx>=100) $ph1idx = $ph1idx/100;
 				$ipsecconnected[$ph1idx] = $ph1idx;
 			} else {
 				if (!ipsec_ikeid_used($con_id)) {
 					// probably a v2 with split connection then
-					$ph1idx = substr($con_id, 0, strrpos(substr($con_id, 0, -1), '00'));
+					$ph1idx = $con_id/1000;
+					if ($ph1idx>=100) $ph1idx = $ph1idx/100;
 					$ipsecconnected[$ph1idx] = $ph1idx;
 				} else {
 					$ipsecconnected[$con_id] = $ph1idx = $con_id;
@@ -584,7 +691,7 @@ function pfz_ipsec_status($ikeid,$reqid=-1,$valuekey='state'){
 					// Asking for Phase2 Status Value
 					foreach ($ikesa['child-sas'] as $childsas) {
 						if ($childsas['reqid']==$reqid) {
-							if ($childsas['state'] == 'REKEYED') {
+							if (strtolower($childsas['state']) == 'rekeyed') {
 								//if state is rekeyed go on
 								$tmp_value = $childsas[$valuekey];
 							} else {
@@ -601,16 +708,17 @@ function pfz_ipsec_status($ikeid,$reqid=-1,$valuekey='state'){
 			}			
 		}	
 	}
+	
 	switch($valuekey) {
 					case 'state':
 						$value = pfz_valuemap('ipsec.state', strtolower($tmp_value));
-						$value = $value + (10 * ($carp_status-1));						
+						if ($carp_status!=0) $value = $value + (10 * ($carp_status-1));						
 						break;
 					default:
 						$value = $tmp_value;
 						break;
 	}
-//	print_r($ikesa);
+	
 	return $value;
 }
 
@@ -914,12 +1022,17 @@ function pfz_get_system_value($section){
      }
 }
 
-
+// File is present
+function pfz_file_exists($filename) {
+	if (file_exists($filename))
+		echo "1";
+	else
+		echo "0";
+}
 
 // Value mappings
 // Each value map is represented by an associative array
 function pfz_valuemap($valuename, $value, $default="0"){
-
      switch ($valuename){     
 
           case "openvpn.server.status":          
@@ -1004,6 +1117,7 @@ function pfz_valuemap($valuename, $value, $default="0"){
      }
 
      if (is_array($valuemap)) {
+     	$value = strtolower($value);
      	if (array_key_exists($value, $valuemap))
           	return $valuemap[$value];
      }
@@ -1015,6 +1129,9 @@ function pfz_discovery($section){
      switch (strtolower($section)){     
           case "gw":
                pfz_gw_discovery();
+               break;
+          case "wan":
+          	   pfz_interface_discovery(true);
                break;
           case "openvpn_server":
                pfz_openvpn_serverdiscovery();
@@ -1054,6 +1171,10 @@ switch (strtolower($argv[1])){
      case "gw_status":
           pfz_gw_rawstatus();
           break;
+	 case "if_speedtest_value":
+	      pfz_speedtest_cron_install();
+	 	  pfz_interface_speedtest_value($argv[2],$argv[3]);
+	 	  break;
      case "openvpn_servervalue":
           pfz_openvpn_servervalue($argv[2],$argv[3]);
           break;
@@ -1087,6 +1208,17 @@ switch (strtolower($argv[1])){
      case "dhcp":
      	  pfz_dhcp($argv[2],$argv[3]);
           break;
+     case "file_exists":
+     	  pfz_file_exists($argv[2]);
+     	  break;
+     case "speedtest_cron":
+     	  pfz_speedtest_cron_install();
+     	  pfz_speedtest_cron();
+     	  break;
+     case "cron_cleanup":
+     	  pfz_speedtest_cron_install(false);
+     	  break;     	  
      default:
           pfz_test();
 }
+
